@@ -1,10 +1,19 @@
 const express = require('express');
-const { S3Client, ListObjectsV2Command } = require('@aws-sdk/client-s3');
+const { S3Client, ListObjectsV2Command, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { RekognitionClient, CompareFacesCommand } = require('@aws-sdk/client-rekognition');
 const multer = require('multer');
+const { MongoClient } = require('mongodb');
+const cors = require('cors')
 
-// Configure AWS SDK v3 clients with credentials from environment variables
-const s3Client = new S3Client({ 
+// Configure MongoDB connection
+const password = 'StudentMarket';
+const uri = `mongodb+srv://StudentMarket:${password}@cluster0.ukbatl8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
+
+const mongoClient = new MongoClient(uri);
+
+
+// Configure AWS SDK v3 clients
+const s3Client = new S3Client({
     region: process.env.AWS_REGION || 'us-east-1',
     credentials: {
         accessKeyId: 'AKIAYQYUBEVQRBDJQGPW',
@@ -12,7 +21,7 @@ const s3Client = new S3Client({
     }
 });
 
-const rekognitionClient = new RekognitionClient({ 
+const rekognitionClient = new RekognitionClient({
     region: process.env.AWS_REGION || 'us-east-1',
     credentials: {
         accessKeyId: 'AKIAYQYUBEVQRBDJQGPW',
@@ -21,6 +30,7 @@ const rekognitionClient = new RekognitionClient({
 });
 
 const app = express();
+app.use(cors())
 const bucketName = 'unimarketgh';
 
 // Middleware to parse JSON request bodies
@@ -31,7 +41,14 @@ const upload = multer({
     storage: multer.memoryStorage(), // Store images in memory
 });
 
-// Endpoint to upload and compare images
+// Connect to MongoDB
+mongoClient.connect()
+    .then(() => {
+        console.log("Connected to MongoDB");
+    })
+    .catch(err => console.error("MongoDB connection error:", err));
+
+// Endpoint to upload, compare, and find the best matching image
 app.post('/upload', upload.single('image'), async (req, res) => {
     try {
         const uploadedImage = req.file;
@@ -58,16 +75,14 @@ app.post('/upload', upload.single('image'), async (req, res) => {
 
         // Compare the uploaded image with each image in the uploads folder
         for (const item of s3Objects.Contents) {
-            // Skip comparison if the item is the uploaded image
             if (item.Key.includes(uploadedImage.originalname)) {
                 console.log('Skipping comparison with itself:', uploadedImage.originalname);
                 continue;
             }
 
-            // Compare with existing images in S3
             const compareParams = {
                 SourceImage: {
-                    Bytes: uploadedImage.buffer // Use the in-memory buffer for the uploaded image
+                    Bytes: uploadedImage.buffer
                 },
                 TargetImage: {
                     S3Object: {
@@ -77,8 +92,6 @@ app.post('/upload', upload.single('image'), async (req, res) => {
                 },
                 SimilarityThreshold: 80
             };
-
-            console.log('Comparing:', uploadedImage.originalname, 'with', item.Key); // Debugging output
 
             const compareCommand = new CompareFacesCommand(compareParams);
             const response = await rekognitionClient.send(compareCommand);
@@ -96,16 +109,73 @@ app.post('/upload', upload.single('image'), async (req, res) => {
         }
 
         if (bestMatch) {
-            res.status(200).send({
-                message: 'Best matching image found',
-                match: bestMatch
-            });
+            // Retrieve user details from MongoDB based on the matching image key
+            const db = mongoClient.db('FaceDectector');
+            const collection = db.collection('imageMetadata');
+            const userMetadata = await collection.findOne({ imageId: bestMatch.key });
+
+            if (userMetadata) {
+                res.status(200).send({
+                    message: 'Best matching image found',
+                    match: bestMatch,
+                    user: {
+                        username: userMetadata.username,
+                        indexNumber: userMetadata.indexNumber,
+                        timestamp: userMetadata.timestamp
+                    }
+                });
+            } else {
+                res.status(404).send({ message: 'No user details found for the matching image' });
+            }
         } else {
             res.status(404).send({ message: 'No matching images found' });
         }
     } catch (error) {
         console.error('Error comparing images:', error);
         res.status(500).send({ message: 'Error comparing images', error });
+    }
+});
+
+// New endpoint to store the uploaded image and metadata in MongoDB
+app.post('/store', upload.single('image'), async (req, res) => {
+    try {
+        const uploadedImage = req.file;
+        const { username, indexNumber } = req.body;
+
+        if (!uploadedImage || !username || !indexNumber) {
+            return res.status(400).send({ message: 'Missing image, username, or index number' });
+        }
+
+        // Upload the image to S3
+        const s3Key = `uploads/${uploadedImage.originalname}`;
+        const uploadParams = {
+            Bucket: bucketName,
+            Key: s3Key,
+            Body: uploadedImage.buffer,
+            ContentType: uploadedImage.mimetype
+        };
+
+        await s3Client.send(new PutObjectCommand(uploadParams));
+
+        // Store metadata in MongoDB
+        const metadata = {
+            imageId: s3Key,
+            username: username,
+            indexNumber: indexNumber,
+            timestamp: new Date()
+        };
+
+        const db = mongoClient.db('FaceDectector');
+        const collection = db.collection('imageMetadata');
+        await collection.insertOne(metadata);
+
+        res.status(201).send({
+            message: 'Image and metadata stored successfully',
+            metadata: metadata
+        });
+    } catch (error) {
+        console.error('Error storing image and metadata:', error);
+        res.status(500).send({ message: 'Error storing image and metadata', error });
     }
 });
 
