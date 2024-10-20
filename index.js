@@ -3,14 +3,14 @@ const { S3Client, ListObjectsV2Command, PutObjectCommand } = require('@aws-sdk/c
 const { RekognitionClient, CompareFacesCommand } = require('@aws-sdk/client-rekognition');
 const multer = require('multer');
 const { MongoClient } = require('mongodb');
-const cors = require('cors')
+const sharp = require('sharp');
+const cors = require('cors');
 
 // Configure MongoDB connection
 const password = 'StudentMarket';
 const uri = `mongodb+srv://StudentMarket:${password}@cluster0.ukbatl8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 const mongoClient = new MongoClient(uri);
-
 
 // Configure AWS SDK v3 clients
 const s3Client = new S3Client({
@@ -30,7 +30,7 @@ const rekognitionClient = new RekognitionClient({
 });
 
 const app = express();
-app.use(cors())
+app.use(cors());
 const bucketName = 'unimarketgh';
 
 // Middleware to parse JSON request bodies
@@ -48,7 +48,7 @@ mongoClient.connect()
     })
     .catch(err => console.error("MongoDB connection error:", err));
 
-// Endpoint to upload, compare, and find the best matching image
+// Endpoint to upload, convert to JPG, compare, and find the best matching image
 app.post('/upload', upload.single('image'), async (req, res) => {
     try {
         const uploadedImage = req.file;
@@ -56,6 +56,11 @@ app.post('/upload', upload.single('image'), async (req, res) => {
         if (!uploadedImage) {
             return res.status(400).send({ message: 'Image upload failed' });
         }
+
+        // Convert the uploaded image to JPG
+        const convertedImageBuffer = await sharp(uploadedImage.buffer)
+            .jpeg()
+            .toBuffer();
 
         // List only images in the 'uploads' folder
         const listParams = {
@@ -73,7 +78,7 @@ app.post('/upload', upload.single('image'), async (req, res) => {
         let bestMatch = null;
         let highestSimilarity = 0;
 
-        // Compare the uploaded image with each image in the uploads folder
+        // Compare the converted image with each image in the uploads folder
         for (const item of s3Objects.Contents) {
             if (item.Key.includes(uploadedImage.originalname)) {
                 console.log('Skipping comparison with itself:', uploadedImage.originalname);
@@ -82,7 +87,7 @@ app.post('/upload', upload.single('image'), async (req, res) => {
 
             const compareParams = {
                 SourceImage: {
-                    Bytes: uploadedImage.buffer
+                    Bytes: convertedImageBuffer
                 },
                 TargetImage: {
                     S3Object: {
@@ -136,7 +141,7 @@ app.post('/upload', upload.single('image'), async (req, res) => {
     }
 });
 
-// New endpoint to store the uploaded image and metadata in MongoDB
+// New endpoint to store the uploaded image as JPG and metadata in MongoDB
 app.post('/store', upload.single('image'), async (req, res) => {
     try {
         const uploadedImage = req.file;
@@ -146,13 +151,18 @@ app.post('/store', upload.single('image'), async (req, res) => {
             return res.status(400).send({ message: 'Missing image, username, or index number' });
         }
 
-        // Upload the image to S3
-        const s3Key = `uploads/${uploadedImage.originalname}`;
+        // Convert the image to JPG
+        const convertedImageBuffer = await sharp(uploadedImage.buffer)
+            .jpeg()
+            .toBuffer();
+
+        // Upload the JPG image to S3
+        const s3Key = `uploads/${uploadedImage.originalname.replace(/\.[^/.]+$/, ".jpg")}`;
         const uploadParams = {
             Bucket: bucketName,
             Key: s3Key,
-            Body: uploadedImage.buffer,
-            ContentType: uploadedImage.mimetype
+            Body: convertedImageBuffer,
+            ContentType: 'image/jpeg'
         };
 
         await s3Client.send(new PutObjectCommand(uploadParams));
